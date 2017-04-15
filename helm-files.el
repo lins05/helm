@@ -3646,6 +3646,265 @@ See `helm-browse-project'."
     (helm-exit-and-execute-action 'helm-ff-gid)))
 (put 'helm-ff-run-gid 'helm-only t)
 
+;;; session.el files
+;;
+;;  session (http://emacs-session.sourceforge.net/) is an alternative to
+;;  recentf that saves recent file history and much more.
+(defvar session-file-alist)
+(defclass helm-source-session-class (helm-source-sync)
+  ((candidates :initform (lambda ()
+                           (cl-delete-if-not
+                            (lambda (f)
+                              (or (string-match helm-tramp-file-name-regexp f)
+                                  (file-exists-p f)))
+                            (mapcar 'car session-file-alist))))
+   (keymap       :initform helm-generic-files-map)
+   (help-message :initform helm-generic-file-help-message)
+   (action       :initform 'helm-type-file-actions)))
+
+(defvar helm-source-session nil
+  "File list from emacs-session.")
+
+(defcustom helm-session-fuzzy-match nil
+  "Enable fuzzy matching in `helm-source-session' when non--nil."
+  :group 'helm-files
+  :type 'boolean
+  :set (lambda (var val)
+         (set var val)
+         (setq helm-source-session
+               (helm-make-source "Session" 'helm-source-session-class
+                 :fuzzy-match val))))
+
+
+;;; Files in current dir
+;;
+;;
+(defun helm-highlight-files (files)
+  "A basic transformer for helm files sources.
+Colorize only symlinks, directories and files."
+  (cl-loop with mp-fn = (or (assoc-default
+                             'match-part (helm-get-current-source))
+                            'identity)
+           for i in files
+           for disp = (if (and helm-ff-transformer-show-only-basename
+                               (not (helm-dir-is-dot i))
+                               (not (and helm--url-regexp
+                                         (string-match helm--url-regexp i)))
+                               (not (string-match helm-ff-url-regexp i)))
+                          (helm-basename i) (abbreviate-file-name i))
+           for isremote = (or (file-remote-p i)
+                              (helm-file-on-mounted-network-p i))
+           ;; Call file-attributes only if:
+           ;; - file is not remote
+           ;; - helm-ff-tramp-not-fancy is nil and file is remote AND
+           ;; connected. (Issue #1679)
+           for type = (and (or (null isremote)
+                               (and (null helm-ff-tramp-not-fancy)
+                                    (file-remote-p i nil t)))
+                           (car (file-attributes i)))
+           collect
+           (cond ((and (null type) isremote) (cons disp i))
+                 ((stringp type)
+                  (cons (propertize disp
+                                    'face 'helm-ff-symlink
+                                    'match-part (funcall mp-fn disp)
+                                    'help-echo (expand-file-name i))
+                        i))
+                 ((eq type t)
+                  (cons (propertize disp
+                                    'face 'helm-ff-directory
+                                    'match-part (funcall mp-fn disp)
+                                    'help-echo (expand-file-name i))
+                        i))
+                 (t (cons (propertize disp
+                                      'face 'helm-ff-file
+                                      'match-part (funcall mp-fn disp)
+                                      'help-echo (expand-file-name i))
+                          i)))))
+
+(defclass helm-files-in-current-dir-source (helm-source-sync helm-type-file)
+  ((candidates :initform (lambda ()
+                           (with-helm-current-buffer
+                             (let ((dir (helm-current-directory)))
+                               (when (file-accessible-directory-p dir)
+                                 (directory-files dir t))))))
+   (pattern-transformer :initform 'helm-recentf-pattern-transformer)
+   (match-part :initform (lambda (candidate)
+                           (if (or helm-ff-transformer-show-only-basename
+                                   helm-recentf--basename-flag)
+                               (helm-basename candidate) candidate)))
+   (fuzzy-match :initform t)
+   (migemo :initform t)))
+
+(defvar helm-source-files-in-current-dir
+  (helm-make-source "Files from Current Directory"
+      helm-files-in-current-dir-source))
+
+
+;;; External searching file tools.
+;;
+;; Tracker desktop search
+(defvar helm-source-tracker-cand-incomplete nil "Contains incomplete candidate")
+(defun helm-source-tracker-transformer (candidates _source)
+  (helm-log "received: %S" candidates)
+  (cl-loop for cand in candidates
+           for path = (when (stringp helm-source-tracker-cand-incomplete)
+                        (caar (helm-highlight-files
+                               (list helm-source-tracker-cand-incomplete))))
+           for built = (if (not (stringp cand)) cand
+                         (let ((snippet cand))
+                           (unless (or (null path)
+                                      (string= "" path)
+                                      (not (string-match-p
+                                          "\\`[[:space:]]*\\.\\.\\."
+                                          snippet)))
+                             (let ((complete-candidate
+                                    (cons (concat path "\n" snippet) path)))
+                               (setq helm-source-tracker-cand-incomplete nil)
+                               (helm-log "built: %S" complete-candidate)
+                               complete-candidate))))
+           when (and (stringp cand)
+                   (string-match "\\`[[:space:]]*file://" cand))
+           do (setq helm-source-tracker-cand-incomplete ; save path
+                    (replace-match "" t t cand)) end
+           collect built))
+
+(defvar helm-source-tracker-search
+  (helm-build-async-source "Tracker Search"
+    :candidates-process
+     (lambda ()
+       (start-process "tracker-search-process" nil
+                      "tracker-search"
+                      "--disable-color"
+                      "--limit=512"
+                      helm-pattern))
+    :filtered-candidate-transformer #'helm-source-tracker-transformer
+    ;;(multiline) ; https://github.com/emacs-helm/helm/issues/529
+    :keymap helm-generic-files-map
+    :action 'helm-type-file-actions
+    :action-transformer '(helm-transform-file-load-el
+                          helm-transform-file-browse-url)
+    :requires-pattern 3)
+  "Source for retrieving files matching the current input pattern
+with the tracker desktop search.")
+
+;; Spotlight (MacOS X desktop search)
+(defclass helm-mac-spotlight-source (helm-source-async helm-type-file)
+  ((candidates-process :initform
+                       (lambda ()
+                         (start-process
+                          "mdfind-process" nil "mdfind" helm-pattern)))
+   (requires-pattern :initform 3)))
+
+(defvar helm-source-mac-spotlight
+  (helm-make-source "mdfind" helm-mac-spotlight-source)
+  "Source for retrieving files via Spotlight's command line
+utility mdfind.")
+
+
+;;; Findutils
+;;
+;;
+(defvar helm-source-findutils
+  (helm-build-async-source "Find"
+    :header-name (lambda (name)
+                   (concat name " in [" (helm-default-directory) "]"))
+    :candidates-process 'helm-find-shell-command-fn
+    :filtered-candidate-transformer 'helm-findutils-transformer
+    :action-transformer 'helm-transform-file-load-el
+    :persistent-action 'helm-ff-kill-or-find-buffer-fname
+    :action 'helm-type-file-actions
+    :keymap helm-generic-files-map
+    :candidate-number-limit 9999
+    :requires-pattern 3))
+
+(defun helm-findutils-transformer (candidates _source)
+  (let (non-essential
+        (default-directory (helm-default-directory)))
+    (cl-loop for i in candidates
+             for abs = (expand-file-name
+                        (helm-aif (file-remote-p default-directory)
+                            (concat it i) i))
+             for type = (car (file-attributes abs))
+             for disp = (if (and helm-ff-transformer-show-only-basename
+                                 (not (string-match "[.]\\{1,2\\}$" i)))
+                            (helm-basename abs) abs)
+             collect (cond ((eq t type)
+                            (cons (propertize disp 'face 'helm-ff-directory)
+                                  abs))
+                           ((stringp type)
+                            (cons (propertize disp 'face 'helm-ff-symlink)
+                                  abs))
+                           (t (cons (propertize disp 'face 'helm-ff-file)
+                                    abs))))))
+
+(defun helm-find--build-cmd-line ()
+  (require 'find-cmd)
+  (let* ((default-directory (or (file-remote-p default-directory 'localname)
+                                default-directory))
+         (patterns+options (split-string helm-pattern "\\(\\`\\| +\\)\\* +"))
+         (fold-case (helm-set-case-fold-search (car patterns+options)))
+         (patterns (split-string (car patterns+options)))
+         (additional-options (and (cdr patterns+options)
+                                  (list (concat (cadr patterns+options) " "))))
+         (ignored-dirs ())
+         (ignored-files (when helm-findutils-skip-boring-files
+                          (cl-loop for f in completion-ignored-extensions
+                                   if (string-match "/$" f)
+                                   do (push (replace-match "" nil t f)
+                                            ignored-dirs)
+                                   else collect (concat "*" f))))
+         (path-or-name (if helm-findutils-search-full-path
+                           '(ipath path) '(iname name)))
+         (name-or-iname (if fold-case
+                            (car path-or-name) (cadr path-or-name))))
+    (find-cmd (and ignored-dirs
+                   `(prune (name ,@ignored-dirs)))
+              (and ignored-files
+                   `(not (name ,@ignored-files)))
+              `(and ,@(mapcar
+                       (lambda (pattern)
+                         `(,name-or-iname ,(concat "*" pattern "*")))
+                       patterns)
+                    ,@additional-options))))
+
+(defun helm-find-shell-command-fn ()
+  "Asynchronously fetch candidates for `helm-find'.
+Additional find options can be specified after a \"*\"
+separator."
+  (let* (process-connection-type
+         non-essential
+         (cmd (helm-find--build-cmd-line))
+         (proc (start-file-process-shell-command "hfind" helm-buffer cmd)))
+    (helm-log "Find command:\n%s" cmd)
+    (prog1 proc
+      (set-process-sentinel
+       proc
+       (lambda (process event)
+           (helm-process-deferred-sentinel-hook
+            process event (helm-default-directory))
+           (if (string= event "finished\n")
+               (with-helm-window
+                 (setq mode-line-format
+                       '(" " mode-line-buffer-identification " "
+                         (:eval (format "L%s" (helm-candidate-number-at-point))) " "
+                         (:eval (propertize
+                                 (format "[Find process finished - (%s results)]"
+                                         (max (1- (count-lines
+                                                   (point-min) (point-max)))
+                                              0))
+                                 'face 'helm-locate-finish))))
+                 (force-mode-line-update))
+               (helm-log "Error: Find %s"
+                         (replace-regexp-in-string "\n" "" event))))))))
+
+(defun helm-find-1 (dir)
+  (let ((default-directory (file-name-as-directory dir)))
+    (helm :sources 'helm-source-findutils
+          :buffer "*helm find*"
+          :ff-transformer-show-only-basename nil
+          :case-fold-search helm-file-name-case-fold-search)))
+
 ;; helm-find bindings for helm-find-files.
 (defun helm-ff-find-sh-command (_candidate)
   "Run `helm-find' from `helm-find-files'."
