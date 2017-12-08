@@ -3847,7 +3847,7 @@ See `helm-browse-project'."
 ;;; Files in current dir
 ;;
 ;;
-(defun helm-highlight-files (files _source)
+(defun helm-highlight-files (files)
   "A basic transformer for helm files sources.
 Colorize only symlinks, directories and files."
   (cl-loop with mp-fn = (or (assoc-default
@@ -3918,8 +3918,7 @@ Colorize only symlinks, directories and files."
   (cl-loop for cand in candidates
            for path = (when (stringp helm-source-tracker-cand-incomplete)
                         (caar (helm-highlight-files
-                               (list helm-source-tracker-cand-incomplete)
-                               nil)))
+                               (list helm-source-tracker-cand-incomplete))))
            for built = (if (not (stringp cand)) cand
                          (let ((snippet cand))
                            (unless (or (null path)
